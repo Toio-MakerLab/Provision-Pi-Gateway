@@ -18,11 +18,13 @@ import (
 )
 
 // Config carries the subset of provisiond configuration needed to open the panel.
-// The I2C address is fixed at 0x3C by the underlying ssd1306 driver, which matches
-// the address used by virtually all common SSD1306 128x64 modules.
 type Config struct {
 	Enabled bool
 	I2CBus  string
+	// Address overrides the I2C device address. periph's ssd1306.NewI2C hardcodes
+	// 0x3C, which most modules use, but some ship at 0x3D — leave 0 or set 0x3C to
+	// use the driver default.
+	Address uint16
 	Width   int
 	Height  int
 }
@@ -73,7 +75,13 @@ func New(cfg Config) (*Display, error) {
 		H:       cfg.Height,
 		Rotated: false,
 	}
-	dev, err := ssd1306.NewI2C(bus, &opts)
+	// ssd1306.NewI2C always talks to address 0x3C internally, so a non-default
+	// Address is applied by intercepting Tx() and substituting the real address.
+	var i2cBus i2c.Bus = bus
+	if cfg.Address != 0 && cfg.Address != 0x3C {
+		i2cBus = &addrOverrideBus{Bus: bus, addr: cfg.Address}
+	}
+	dev, err := ssd1306.NewI2C(i2cBus, &opts)
 	if err != nil {
 		_ = bus.Close()
 		return nil, fmt.Errorf("init ssd1306: %w", err)
@@ -131,6 +139,17 @@ func (d *Display) Close() error {
 		return d.bus.Close()
 	}
 	return nil
+}
+
+// addrOverrideBus wraps an i2c.Bus and replaces whatever address the caller passes
+// to Tx with a fixed one, working around ssd1306.NewI2C's hardcoded 0x3C.
+type addrOverrideBus struct {
+	i2c.Bus
+	addr uint16
+}
+
+func (b *addrOverrideBus) Tx(_ uint16, w, r []byte) error {
+	return b.Bus.Tx(b.addr, w, r)
 }
 
 func statusLines(st Status) []string {

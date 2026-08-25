@@ -37,11 +37,12 @@ type Config struct {
 	AllowReboot    bool
 	AdminToken     string
 
-	OLEDEnabled bool
-	OLEDI2CBus  string
-	OLEDWidth   int
-	OLEDHeight  int
-	OLEDRefresh time.Duration
+	OLEDEnabled    bool
+	OLEDI2CBus     string
+	OLEDI2CAddress uint16
+	OLEDWidth      int
+	OLEDHeight     int
+	OLEDRefresh    time.Duration
 }
 
 type Service struct {
@@ -115,6 +116,19 @@ func getenvInt(key string, fallback int) int {
 	return n
 }
 
+func getenvUint16(key string, fallback uint16) uint16 {
+	v := getenv(key, "")
+	if v == "" {
+		return fallback
+	}
+	// base 0 accepts both "0x3d" and plain decimal.
+	n, err := strconv.ParseUint(v, 0, 16)
+	if err != nil {
+		return fallback
+	}
+	return uint16(n)
+}
+
 func configFromEnv() Config {
 	return Config{
 		Interface:      getenv("WIFI_INTERFACE", "wlan0"),
@@ -130,11 +144,12 @@ func configFromEnv() Config {
 		AllowReboot:    getenvBool("ALLOW_REBOOT", false),
 		AdminToken:     getenv("ADMIN_TOKEN", ""),
 
-		OLEDEnabled: getenvBool("OLED_ENABLED", true),
-		OLEDI2CBus:  getenv("OLED_I2C_BUS", ""),
-		OLEDWidth:   getenvInt("OLED_WIDTH", 128),
-		OLEDHeight:  getenvInt("OLED_HEIGHT", 64),
-		OLEDRefresh: getenvDuration("OLED_REFRESH", 5*time.Second),
+		OLEDEnabled:    getenvBool("OLED_ENABLED", true),
+		OLEDI2CBus:     getenv("OLED_I2C_BUS", ""),
+		OLEDI2CAddress: getenvUint16("OLED_I2C_ADDRESS", 0x3C),
+		OLEDWidth:      getenvInt("OLED_WIDTH", 128),
+		OLEDHeight:     getenvInt("OLED_HEIGHT", 64),
+		OLEDRefresh:    getenvDuration("OLED_REFRESH", 5*time.Second),
 	}
 }
 
@@ -155,6 +170,7 @@ func main() {
 	disp, err := display.New(display.Config{
 		Enabled: cfg.OLEDEnabled,
 		I2CBus:  cfg.OLEDI2CBus,
+		Address: cfg.OLEDI2CAddress,
 		Width:   cfg.OLEDWidth,
 		Height:  cfg.OLEDHeight,
 	})
