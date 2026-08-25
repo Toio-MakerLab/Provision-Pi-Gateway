@@ -295,12 +295,44 @@ func (s *Service) routes() http.Handler {
 	mux.HandleFunc("GET /", s.handleIndex)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
-	mux.HandleFunc("GET /api/wifi/scan", s.handleScan)
-	mux.HandleFunc("POST /api/wifi/connect", s.handleConnect)
+	mux.HandleFunc("GET /api/wifi/scan", s.requireTokenUnlessAP(s.handleScan))
+	mux.HandleFunc("POST /api/wifi/connect", s.requireTokenUnlessAP(s.handleConnect))
+	mux.HandleFunc("POST /api/ap/enable", s.requireToken(s.handleEnableAP))
 	mux.HandleFunc("DELETE /api/wifi/profile", s.requireToken(s.handleDeleteProfile))
 	mux.HandleFunc("POST /api/reset-network", s.requireToken(s.handleResetNetwork))
 	mux.HandleFunc("POST /api/reboot", s.requireToken(s.handleReboot))
 	return securityHeaders(s.limitBody(mux))
+}
+
+// isFromAP reports whether the request was accepted on the setup AP's own address.
+// HTTP_ADDRESS binds every interface (":8080"), so without this check a phone
+// setting up Wi-Fi for the first time via the AP and any device already on the
+// same home LAN would both hit the exact same unauthenticated endpoints.
+func (s *Service) isFromAP(r *http.Request) bool {
+	local, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	if !ok {
+		return false
+	}
+	host, _, err := net.SplitHostPort(local.String())
+	if err != nil {
+		host = local.String()
+	}
+	return host == s.cfg.APAddress
+}
+
+// requireTokenUnlessAP allows self-service Wi-Fi setup with no token for clients
+// connected directly to the setup AP (knowing the AP SSID/password already proves
+// physical proximity), but requires the admin token for the same call when reached
+// over the real Wi-Fi network — otherwise anyone else on that network could silently
+// repoint the device's Wi-Fi or read scan results.
+func (s *Service) requireTokenUnlessAP(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.isFromAP(r) {
+			next(w, r)
+			return
+		}
+		s.requireToken(next)(w, r)
+	}
 }
 
 func (s *Service) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -390,6 +422,15 @@ func (s *Service) handleConnect(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Service) handleEnableAP(w http.ResponseWriter, r *http.Request) {
+	if err := s.enableAP(r.Context()); err != nil {
+		s.logger.Error("manual AP enable failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "cannot start setup AP")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "Setup AP is active."})
+}
+
 func (s *Service) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 	if err := s.forgetWiFiProfile(r.Context()); err != nil {
 		s.logger.Error("delete Wi-Fi profile failed", "error", err)
@@ -397,6 +438,7 @@ func (s *Service) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.enableAP(r.Context()); err != nil {
+		s.logger.Error("enable AP after profile delete failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "Wi-Fi profile removed but AP could not start")
 		return
 	}
@@ -410,6 +452,7 @@ func (s *Service) handleResetNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.enableAP(r.Context()); err != nil {
+		s.logger.Error("enable AP after network reset failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "Wi-Fi was reset but AP could not start")
 		return
 	}
@@ -558,11 +601,22 @@ func (s *Service) enableAP(ctx context.Context) error {
 		s.apOn = true
 		return nil
 	}
-	err = run(ctx, "sudo", "/usr/local/lib/rpi-provision/rpi-provision", "ap-up", s.cfg.Interface, s.cfg.APProfile, s.cfg.APSSID, s.cfg.APPassword, s.cfg.APAddress)
-	if err == nil {
-		s.apOn = true
+
+	// Retries because ap-up frequently races a just-finished disconnect (e.g. a
+	// deleted or failed STA profile): nmcli reports the device as free before
+	// wlan0 has actually settled, and "connection up" fails transiently.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		lastErr = run(ctx, "sudo", "/usr/local/lib/rpi-provision/rpi-provision", "ap-up", s.cfg.Interface, s.cfg.APProfile, s.cfg.APSSID, s.cfg.APPassword, s.cfg.APAddress)
+		if lastErr == nil {
+			s.apOn = true
+			return nil
+		}
 	}
-	return err
+	return lastErr
 }
 
 func (s *Service) disableAP(ctx context.Context) error {
@@ -697,13 +751,20 @@ const indexHTML = `<!doctype html>
 <style>
 :root{color-scheme:light dark}body{font-family:system-ui,sans-serif;margin:0;background:#f4f7fb;color:#162033}.card{max-width:540px;margin:32px auto;padding:24px;background:#fff;border-radius:12px;box-shadow:0 6px 20px #0002}h1{margin-top:0;font-size:1.4rem}label{display:block;margin-top:14px;font-weight:600}input,select,button{box-sizing:border-box;width:100%;margin-top:6px;padding:11px;border-radius:8px;border:1px solid #aab4c4;font:inherit}button{border:0;background:#0759c7;color:#fff;cursor:pointer;font-weight:700;margin-top:20px}button:disabled{opacity:.6;cursor:wait}#status{padding:10px;border-radius:8px;background:#eaf1ff;margin:12px 0;white-space:pre-wrap}.muted{font-size:.9rem;color:#596579}.error{background:#ffe8e8!important;color:#8b1111}.ok{background:#e6f8eb!important;color:#125e26}@media(prefers-color-scheme:dark){body{background:#121820;color:#e8edf8}.card{background:#1b2430}input,select{background:#111923;color:#e8edf8;border-color:#526277}#status{background:#1a355d}.error{background:#4e1b22!important}.ok{background:#153d24!important}}</style>
 </head>
-<body><main class="card"><h1>Connect this device to Wi‑Fi</h1><p class="muted">Choose your network and enter its password. The setup Wi‑Fi will disconnect after success.</p><div id="status">Loading status…</div><form id="form"><label for="ssid">Wi‑Fi network</label><select id="ssid" required><option value="">Scan is running…</option></select><label for="password">Password</label><input id="password" type="password" maxlength="63" autocomplete="current-password" placeholder="Leave empty for open networks"><button id="submit" type="submit">Connect</button></form><button id="rescan" type="button">Scan again</button></main>
+<body><main class="card"><h1>Connect this device to Wi‑Fi</h1><p class="muted">Choose your network and enter its password. The setup Wi‑Fi will disconnect after success.</p><div id="status">Loading status…</div><form id="form"><label for="ssid">Wi‑Fi network</label><select id="ssid" required><option value="">Scan is running…</option></select><label for="password">Password</label><input id="password" type="password" maxlength="63" autocomplete="current-password" placeholder="Leave empty for open networks"><button id="submit" type="submit">Connect</button></form><button id="rescan" type="button">Scan again</button>
+<details id="admin"><summary>Admin</summary><label for="token">Admin token</label><input id="token" type="password" autocomplete="off" placeholder="Required unless connected to the setup Wi‑Fi"><button id="openap" type="button">Open setup AP</button><button id="forget" type="button">Forget saved Wi‑Fi</button></details>
+</main>
 <script>
 const $=id=>document.getElementById(id), status=$('status');
 function msg(text,kind=''){status.textContent=text;status.className=kind}
-async function api(path,opts){const r=await fetch(path,opts);let b;try{b=await r.json()}catch{b={error:'Invalid server response'}}if(!r.ok)throw new Error(b.error||b.message||'Request failed');return b}
+function token(){return sessionStorage.getItem('adminToken')||''}
+async function api(path,opts={}){opts.headers=Object.assign({},opts.headers,token()?{'X-Admin-Token':token()}:{});const r=await fetch(path,opts);let b;try{b=await r.json()}catch{b={error:'Invalid server response'}}if(!r.ok)throw new Error(b.error||b.message||'Request failed');return b}
 async function loadStatus(){try{const s=await api('/api/status');msg(s.connected?('Connected: '+(s.ssid||'Wi‑Fi')+' '+(s.ipv4||'')):('Setup AP active. Open '+(s.provisioning_url||location.origin)),'ok')}catch(e){msg(e.message,'error')}}
 async function scan(){const select=$('ssid');select.innerHTML='<option>Scanning…</option>';try{const ns=await api('/api/wifi/scan');select.innerHTML='<option value="">Select a Wi‑Fi network</option>';for(const n of ns){const o=document.createElement('option');o.value=n.ssid;o.textContent=n.ssid+' — '+n.signal+'% '+(n.security?('('+n.security+')'):'');select.appendChild(o)}if(ns.length===0)msg('No visible Wi‑Fi networks. Move closer to the router and scan again.','error')}catch(e){select.innerHTML='<option value="">Scan failed</option>';msg(e.message,'error')}}
 $('form').addEventListener('submit',async e=>{e.preventDefault();const b=$('submit');b.disabled=true;msg('Connecting… this can take up to 35 seconds.');try{const r=await api('/api/wifi/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid:$('ssid').value,password:$('password').value})});msg(r.message,'ok')}catch(e){msg(e.message,'error')}finally{b.disabled=false}});
+$('token').value=token();
+$('token').addEventListener('change',()=>sessionStorage.setItem('adminToken',$('token').value));
+$('openap').addEventListener('click',async()=>{try{const r=await api('/api/ap/enable',{method:'POST'});msg(r.message,'ok')}catch(e){msg(e.message,'error')}});
+$('forget').addEventListener('click',async()=>{if(!confirm('Forget the saved Wi‑Fi network and open the setup AP?'))return;try{const r=await api('/api/wifi/profile',{method:'DELETE'});msg(r.message,'ok')}catch(e){msg(e.message,'error')}});
 $('rescan').onclick=scan;loadStatus();scan();
 </script></body></html>`

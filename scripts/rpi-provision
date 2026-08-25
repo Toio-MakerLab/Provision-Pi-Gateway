@@ -6,7 +6,11 @@ SYSTEMCTL=/usr/bin/systemctl
 WIFI_INTERFACE_DEFAULT=wlan0
 
 fail() { echo "rpi-provision: $*" >&2; exit 1; }
-valid_no_newline() { [[ "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *$'\0'* ]]; }
+# NUL can never actually appear here (argv is NUL-terminated at the OS level, so a
+# NUL byte would truncate the argument before bash ever sees it) — checking for it
+# via `$'\0'` is unrepresentable in bash (`$'\0'` evaluates to an empty string, which
+# would make the pattern match everything and reject every non-empty SSID/password).
+valid_no_newline() { [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]]; }
 valid_profile() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; }
 valid_ifname() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,15}$ ]]; }
 valid_ssid() { [[ -n "$1" && ${#1} -le 32 ]] && valid_no_newline "$1"; }
