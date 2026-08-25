@@ -1,0 +1,12 @@
+[Unit]
+Description=Request Wi-Fi reset through boot flag
+ConditionPathExists=/boot/firmware/RESET_WIFI
+Before=provisiond.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/rpi-provision/rpi-provision forget-wifi wlan0 device-provision-ap
+ExecStart=/usr/bin/rm -f /boot/firmware/RESET_WIFI
+
+[Install]
+WantedBy=multi-user.target

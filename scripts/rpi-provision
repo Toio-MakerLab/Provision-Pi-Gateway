@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NMCLI=/usr/bin/nmcli
+SYSTEMCTL=/usr/bin/systemctl
+WIFI_INTERFACE_DEFAULT=wlan0
+
+fail() { echo "rpi-provision: $*" >&2; exit 1; }
+valid_no_newline() { [[ "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *$'\0'* ]]; }
+valid_profile() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; }
+valid_ifname() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,15}$ ]]; }
+valid_ssid() { [[ -n "$1" && ${#1} -le 32 ]] && valid_no_newline "$1"; }
+valid_password() { [[ ${#1} -le 63 ]] && valid_no_newline "$1"; }
+valid_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  ap-up)
+    [[ $# -eq 5 ]] || fail "usage: ap-up IFACE PROFILE SSID PASSWORD ADDRESS"
+    iface="$1" profile="$2" ssid="$3" password="$4" address="$5"
+    valid_ifname "$iface" && valid_profile "$profile" && valid_ssid "$ssid" && valid_password "$password" && valid_ipv4 "$address" || fail "invalid argument"
+    if ! "$NMCLI" -t -f NAME connection show | grep -Fxq "$profile"; then
+      "$NMCLI" connection add type wifi ifname "$iface" con-name "$profile" ssid "$ssid" \
+        wifi.mode ap ipv4.method shared ipv4.addresses "${address}/24" ipv6.method disabled \
+        connection.autoconnect no
+      "$NMCLI" connection modify "$profile" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$password"
+    else
+      "$NMCLI" connection modify "$profile" connection.interface-name "$iface" 802-11-wireless.ssid "$ssid" \
+        802-11-wireless.mode ap ipv4.method shared ipv4.addresses "${address}/24" ipv6.method disabled \
+        connection.autoconnect no wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$password"
+    fi
+    "$NMCLI" connection up "$profile" ifname "$iface"
+    ;;
+
+  ap-down)
+    [[ $# -eq 1 ]] && valid_profile "$1" || fail "usage: ap-down PROFILE"
+    "$NMCLI" connection down "$1" || true
+    ;;
+
+  connect)
+    [[ $# -eq 4 ]] || fail "usage: connect IFACE PROFILE SSID PASSWORD"
+    iface="$1" profile="$2" ssid="$3" password="$4"
+    valid_ifname "$iface" && valid_profile "$profile" && valid_ssid "$ssid" && valid_password "$password" || fail "invalid argument"
+    "$NMCLI" device wifi connect "$ssid" password "$password" ifname "$iface" name "$profile"
+    "$NMCLI" connection modify "$profile" connection.autoconnect yes connection.autoconnect-priority 100
+    ;;
+
+  delete-wifi-profile)
+    [[ $# -eq 1 ]] && valid_profile "$1" || fail "usage: delete-wifi-profile PROFILE"
+    "$NMCLI" connection delete "$1" 2>/dev/null || true
+    ;;
+
+  forget-wifi)
+    [[ $# -eq 2 ]] || fail "usage: forget-wifi IFACE AP_PROFILE"
+    iface="$1" ap_profile="$2"
+    valid_ifname "$iface" && valid_profile "$ap_profile" || fail "invalid argument"
+    mapfile -t profiles < <("$NMCLI" -t -f NAME,TYPE connection show | awk -F: '$2 == "802-11-wireless" {print $1}')
+    for p in "${profiles[@]}"; do
+      [[ "$p" == "$ap_profile" ]] && continue
+      "$NMCLI" connection delete "$p" || true
+    done
+    "$NMCLI" device disconnect "$iface" || true
+    ;;
+
+  reboot)
+    [[ $# -eq 0 ]] || fail "usage: reboot"
+    "$SYSTEMCTL" reboot
+    ;;
+
+  *) fail "unknown command" ;;
+esac

@@ -1,0 +1,36 @@
+[Unit]
+Description=Raspberry Pi Wi-Fi provisioning portal
+Wants=NetworkManager.service
+After=NetworkManager.service network-online.target
+
+[Service]
+Type=simple
+User=provision
+Group=provision
+# /dev/i2c-1 on Raspberry Pi OS is owned by root:i2c mode 0660; join that group so
+# the OLED status display can be opened without running as root.
+SupplementaryGroups=i2c
+EnvironmentFile=/etc/rpi-provision/provisiond.env
+ExecStart=/usr/local/bin/provisiond
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+# PrivateDevices intentionally left false: the OLED status display needs real access
+# to /dev/i2c-*. All other sandboxing directives below still apply.
+PrivateDevices=false
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+ReadWritePaths=/run /var/lib/rpi-provision
+
+[Install]
+WantedBy=multi-user.target
