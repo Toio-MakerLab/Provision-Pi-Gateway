@@ -133,3 +133,12 @@ POST /api/reset-network
 POST /api/reboot
   Reboot thiết bị. Chỉ hoạt động nếu ALLOW_REBOOT=true trong provisiond.env (mặc định false → 403).
   curl -X POST http://<pi-ip>:8080/api/reboot -H "X-Admin-Token: <token>"
+
+Không có mDNS (mạng lạ/router chặn) — quét mạng
+
+Từ máy khác cùng Wi-Fi:
+# macOS/Linux
+arp -a | grep -i b8:27:eb   # Raspberry Pi MAC prefix cũ, hoặc dc:a6:32 / e4:5f:01 cho Pi mới
+# hoặc
+nmap -sn 192.168.1.0/24     # đổi đúng subnet router nhà bạn
+Hoặc vào trang quản trị router (DHCP client list) — thường có tên pi-gateway.
