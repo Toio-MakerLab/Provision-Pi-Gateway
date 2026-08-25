@@ -7,15 +7,20 @@ After=NetworkManager.service network-online.target
 Type=simple
 User=provision
 Group=provision
-# /dev/i2c-1 on Raspberry Pi OS is owned by root:i2c mode 0660; join that group so
-# the OLED status display can be opened without running as root.
-SupplementaryGroups=i2c
+# /dev/i2c-1 is owned by root:i2c mode 0660. periph.io's host.Init() also probes
+# /dev/gpiochip* (owned by root:gpio) while registering its GPIO driver, even though
+# this daemon only uses I2C — without the gpio group that probe logs a harmless but
+# noisy "permission denied" on every start.
+SupplementaryGroups=i2c gpio
 EnvironmentFile=/etc/rpi-provision/provisiond.env
 ExecStart=/usr/local/bin/provisiond
 Restart=on-failure
 RestartSec=3
 
-NoNewPrivileges=true
+# NoNewPrivileges must stay false: this daemon escalates via `sudo` (whitelisted in
+# /etc/sudoers.d/rpi-provision) to change network/AP state. NoNewPrivileges=true
+# blocks setuid-based privilege escalation entirely, which breaks sudo itself.
+NoNewPrivileges=false
 PrivateTmp=true
 # PrivateDevices intentionally left false: the OLED status display needs real access
 # to /dev/i2c-*. All other sandboxing directives below still apply.

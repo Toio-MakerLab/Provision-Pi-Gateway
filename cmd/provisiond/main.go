@@ -122,7 +122,7 @@ func configFromEnv() Config {
 		APSSID:         getenv("AP_SSID", "MyDevice-Setup"),
 		APPassword:     getenv("AP_PASSWORD", "ChangeMe-123"),
 		APAddress:      getenv("AP_ADDRESS", "192.168.12.1"),
-		HTTPAddress:    getenv("HTTP_ADDRESS", "192.168.12.1:8080"),
+		HTTPAddress:    getenv("HTTP_ADDRESS", ":8080"),
 		WiFiProfile:    getenv("WIFI_PROFILE", "device-wifi"),
 		ConnectTimeout: getenvDuration("CONNECT_TIMEOUT", 35*time.Second),
 		RetryTimeout:   getenvDuration("RETRY_TIMEOUT", 25*time.Second),
@@ -186,9 +186,18 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
+	// HTTP_ADDRESS binds to a specific interface IP (e.g. the AP address), which
+	// NetworkManager can take a moment to actually assign after "connection up"
+	// reports active. Retry the bind instead of failing on the first race.
+	listener, err := waitForListener(ctx, cfg.HTTPAddress, 20*time.Second)
+	if err != nil {
+		logger.Error("cannot bind HTTP address", "address", cfg.HTTPAddress, "error", err)
+		os.Exit(1)
+	}
+
 	go func() {
 		logger.Info("HTTP provisioning server started", "address", cfg.HTTPAddress)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("HTTP server stopped", "error", err)
 			cancel()
 		}
@@ -237,6 +246,26 @@ func (s *Service) runDisplay(ctx context.Context) {
 			return
 		case <-ticker.C:
 			render()
+		}
+	}
+}
+
+func waitForListener(ctx context.Context, addr string, timeout time.Duration) (net.Listener, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if l, err := net.Listen("tcp", addr); err == nil {
+			return l, nil
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return nil, lastErr
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(500 * time.Millisecond):
 		}
 	}
 }
@@ -584,7 +613,11 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'")
+		// indexHTML embeds its <script> and <style> inline, so both need 'unsafe-inline';
+		// without script-src explicitly listed here it would inherit default-src, which
+		// silently blocks the inline script and leaves the page stuck on its static
+		// "Loading status…" placeholder with no console-visible network error.
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'")
 		next.ServeHTTP(w, r)
 	})
 }

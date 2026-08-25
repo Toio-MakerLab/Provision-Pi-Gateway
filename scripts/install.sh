@@ -50,7 +50,10 @@ fi
 
 systemctl enable --now nftables
 systemctl daemon-reload
-systemctl enable --now provisiond.service
+systemctl enable provisiond.service
+# `restart` (not `enable --now`) so re-running this script after a rebuild always
+# picks up the new binary/unit file, even if the service was already running.
+systemctl restart provisiond.service
 
 echo "Installed. Update /etc/rpi-provision/provisiond.env before production deployment."
 echo "Logs: journalctl -u provisiond -f"
