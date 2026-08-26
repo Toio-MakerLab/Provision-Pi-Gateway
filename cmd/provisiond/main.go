@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"example.com/rpi-provisioning/internal/display"
+	"example.com/rpi-provisioning/internal/sysinfo"
 )
 
 type Config struct {
@@ -38,6 +39,7 @@ type Config struct {
 	AdminToken     string
 
 	OLEDEnabled    bool
+	OLEDDriver     display.Driver
 	OLEDI2CBus     string
 	OLEDI2CAddress uint16
 	OLEDWidth      int
@@ -145,6 +147,7 @@ func configFromEnv() Config {
 		AdminToken:     getenv("ADMIN_TOKEN", ""),
 
 		OLEDEnabled:    getenvBool("OLED_ENABLED", true),
+		OLEDDriver:     display.Driver(getenv("OLED_DRIVER", string(display.DriverSH1106))),
 		OLEDI2CBus:     getenv("OLED_I2C_BUS", ""),
 		OLEDI2CAddress: getenvUint16("OLED_I2C_ADDRESS", 0x3C),
 		OLEDWidth:      getenvInt("OLED_WIDTH", 128),
@@ -169,18 +172,22 @@ func main() {
 
 	disp, err := display.New(display.Config{
 		Enabled: cfg.OLEDEnabled,
+		Driver:  cfg.OLEDDriver,
 		I2CBus:  cfg.OLEDI2CBus,
 		Address: cfg.OLEDI2CAddress,
 		Width:   cfg.OLEDWidth,
 		Height:  cfg.OLEDHeight,
 	})
 	if err != nil {
-		logger.Warn("OLED display unavailable; continuing without it", "error", err)
+		logger.Warn("OLED display unavailable; will keep retrying", "error", err)
 	} else {
 		s.disp = disp
 	}
 	defer func() {
-		if err := s.disp.Close(); err != nil {
+		s.mu.Lock()
+		disp := s.disp
+		s.mu.Unlock()
+		if err := disp.Close(); err != nil {
 			logger.Warn("closing OLED display", "error", err)
 		}
 	}()
@@ -231,17 +238,22 @@ func main() {
 // the exact same status computation as the HTTP /api/status endpoint so the screen
 // never disagrees with the portal.
 func (s *Service) runDisplay(ctx context.Context) {
-	if s.disp == nil {
+	if !s.cfg.OLEDEnabled {
 		return
 	}
 	ticker := time.NewTicker(s.cfg.OLEDRefresh)
 	defer ticker.Stop()
 
 	render := func() {
+		disp := s.getDisplay()
+		if disp == nil {
+			return
+		}
 		st, err := s.status(ctx)
 		if err != nil {
 			return
 		}
+		sys := sysinfo.Read()
 		dst := display.Status{
 			APActive:        st.APActive,
 			Connected:       st.Connected,
@@ -249,8 +261,11 @@ func (s *Service) runDisplay(ctx context.Context) {
 			IPv4:            st.IPv4,
 			APSSID:          s.cfg.APSSID,
 			ProvisioningURL: st.ProvisioningURL,
+			Uptime:          sys.Uptime,
+			MemPercent:      sys.MemPercent,
+			DiskPercent:     sys.DiskPercent,
 		}
-		if err := s.disp.Render(dst); err != nil {
+		if err := disp.Render(dst); err != nil {
 			s.logger.Warn("render OLED display", "error", err)
 		}
 	}
@@ -264,6 +279,39 @@ func (s *Service) runDisplay(ctx context.Context) {
 			render()
 		}
 	}
+}
+
+// getDisplay returns the active OLED display, opening it lazily if the
+// attempt in main() failed. On Raspberry Pi /dev/i2c-1 can still be missing
+// for a few seconds after boot (the i2c-dev kernel module/overlay hasn't
+// loaded yet by the time provisiond starts) - without a retry the screen
+// would otherwise stay blank for the rest of that boot.
+func (s *Service) getDisplay() *display.Display {
+	s.mu.Lock()
+	disp := s.disp
+	s.mu.Unlock()
+	if disp != nil {
+		return disp
+	}
+
+	disp, err := display.New(display.Config{
+		Enabled: s.cfg.OLEDEnabled,
+		Driver:  s.cfg.OLEDDriver,
+		I2CBus:  s.cfg.OLEDI2CBus,
+		Address: s.cfg.OLEDI2CAddress,
+		Width:   s.cfg.OLEDWidth,
+		Height:  s.cfg.OLEDHeight,
+	})
+	if err != nil {
+		s.logger.Warn("OLED display still unavailable", "error", err)
+		return nil
+	}
+
+	s.logger.Info("OLED display became available")
+	s.mu.Lock()
+	s.disp = disp
+	s.mu.Unlock()
+	return disp
 }
 
 func waitForListener(ctx context.Context, addr string, timeout time.Duration) (net.Listener, error) {
@@ -496,6 +544,7 @@ func (s *Service) status(ctx context.Context) (Status, error) {
 	}
 	active, _ := s.apActive(ctx)
 	st := Status{Interface: s.cfg.Interface, APActive: active}
+	var profile string
 	for _, line := range strings.Split(strings.TrimSpace(state), "\n") {
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) != 2 {
@@ -506,10 +555,25 @@ func (s *Service) status(ctx context.Context) (Status, error) {
 			st.Connected = strings.HasPrefix(parts[1], "100")
 		case "GENERAL.CONNECTION":
 			if parts[1] != "--" && parts[1] != s.cfg.APProfile {
-				st.SSID = parts[1]
+				profile = parts[1]
 			}
 		case "IP4.ADDRESS[1]":
 			st.IPv4 = strings.Split(parts[1], "/")[0]
+		}
+	}
+	if profile != "" {
+		// GENERAL.CONNECTION above is the NetworkManager connection profile
+		// name, not the SSID - connectWiFi always creates that profile under
+		// the fixed name s.cfg.WiFiProfile ("device-wifi" by default)
+		// regardless of which network it joins, so using it directly as the
+		// SSID would show "device-wifi" no matter what's actually connected.
+		// The profile's 802-11-wireless.ssid property holds the real SSID.
+		st.SSID = profile
+		if ssid, err := runOutput(ctx, "nmcli", "-t", "-f", "802-11-wireless.ssid", "connection", "show", profile); err == nil {
+			parts := strings.SplitN(strings.TrimSpace(ssid), ":", 2)
+			if len(parts) == 2 && parts[1] != "" {
+				st.SSID = parts[1]
+			}
 		}
 	}
 	if st.APActive {
