@@ -258,8 +258,29 @@ func (d *Display) Render(st Status) error {
 	if d == nil {
 		return nil
 	}
+	return d.drawLines(d.statusLines(st))
+}
 
-	lines := d.statusLines(st)
+// ShowLines draws arbitrary text instead of a Status snapshot, using the same
+// centered layout and change-skipping as Render. It exists for transient
+// screens that have no Status to derive from - e.g. the hardware reset
+// button's hold countdown and "Resetting Wi-Fi..." confirmation.
+func (d *Display) ShowLines(lines ...string) error {
+	if d == nil {
+		return nil
+	}
+	max := d.maxChars()
+	truncated := make([]string, len(lines))
+	for i, line := range lines {
+		truncated[i] = truncate(line, max)
+	}
+	return d.drawLines(truncated)
+}
+
+// drawLines renders lines onto the panel. It skips the I2C write entirely
+// when the content hasn't changed since the last call, to avoid needless bus
+// traffic.
+func (d *Display) drawLines(lines []string) error {
 	text := strings.Join(lines, "\n")
 
 	d.mu.Lock()

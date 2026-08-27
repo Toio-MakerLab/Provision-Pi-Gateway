@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"example.com/rpi-provisioning/internal/display"
+	"example.com/rpi-provisioning/internal/gpio"
 	"example.com/rpi-provisioning/internal/sysinfo"
 )
 
@@ -37,6 +38,10 @@ type Config struct {
 	ResetFlag      string
 	AllowReboot    bool
 	AdminToken     string
+
+	ResetButtonEnabled  bool
+	ResetButtonPin      string
+	ResetButtonHoldTime time.Duration
 
 	OLEDEnabled    bool
 	OLEDDriver     display.Driver
@@ -146,6 +151,10 @@ func configFromEnv() Config {
 		AllowReboot:    getenvBool("ALLOW_REBOOT", false),
 		AdminToken:     getenv("ADMIN_TOKEN", ""),
 
+		ResetButtonEnabled:  getenvBool("RESET_BUTTON_ENABLED", true),
+		ResetButtonPin:      getenv("RESET_BUTTON_PIN", "17"),
+		ResetButtonHoldTime: getenvDuration("RESET_BUTTON_HOLD_TIME", 3*time.Second),
+
 		OLEDEnabled:    getenvBool("OLED_ENABLED", true),
 		OLEDDriver:     display.Driver(getenv("OLED_DRIVER", string(display.DriverSH1106))),
 		OLEDI2CBus:     getenv("OLED_I2C_BUS", ""),
@@ -192,6 +201,15 @@ func main() {
 		}
 	}()
 
+	button, err := gpio.New(gpio.Config{
+		Enabled:  cfg.ResetButtonEnabled,
+		Pin:      cfg.ResetButtonPin,
+		HoldTime: cfg.ResetButtonHoldTime,
+	})
+	if err != nil {
+		logger.Warn("reset button unavailable", "error", err)
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -228,6 +246,45 @@ func main() {
 
 	go s.runDisplay(ctx)
 
+	// button is nil (and Watch a no-op) when the reset button is disabled or
+	// its pin couldn't be opened, so this is always safe to start.
+	go button.Watch(ctx, gpio.Callbacks{
+		// OnPress shows a "Factory Reset" countdown for as long as the button
+		// stays down, so someone holding it gets feedback that it registered
+		// well before the full HoldTime - and how much longer to keep holding.
+		OnPress: func(held time.Duration) {
+			disp := s.getDisplay()
+			if disp == nil {
+				return
+			}
+			remaining := cfg.ResetButtonHoldTime - held
+			if remaining < 0 {
+				remaining = 0
+			}
+			remainingSeconds := int(remaining / time.Second)
+			if remaining%time.Second != 0 {
+				remainingSeconds++ // round up so the countdown reads 3,2,1 instead of dropping straight to 0
+			}
+			_ = disp.ShowLines("Factory Reset", fmt.Sprintf("Hold %ds more", remainingSeconds), "Release to cancel")
+		},
+		// OnRelease fires whether or not the hold completed - if it was
+		// released early (cancelled) the countdown would otherwise stay on
+		// screen until runDisplay's next OLEDRefresh tick.
+		OnRelease: func() {
+			s.renderStatus(ctx)
+		},
+		OnHold: func() {
+			logger.Warn("reset button held; resetting Wi-Fi", "pin", cfg.ResetButtonPin, "hold", cfg.ResetButtonHoldTime.String())
+			if disp := s.getDisplay(); disp != nil {
+				_ = disp.ShowLines("Factory Reset", "Resetting Wi-Fi...")
+			}
+			if err := s.resetWiFi(context.Background()); err != nil {
+				logger.Error("reset button triggered Wi-Fi reset failed", "error", err)
+			}
+			s.renderStatus(ctx)
+		},
+	})
+
 	<-ctx.Done()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
@@ -244,40 +301,44 @@ func (s *Service) runDisplay(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.OLEDRefresh)
 	defer ticker.Stop()
 
-	render := func() {
-		disp := s.getDisplay()
-		if disp == nil {
-			return
-		}
-		st, err := s.status(ctx)
-		if err != nil {
-			return
-		}
-		sys := sysinfo.Read()
-		dst := display.Status{
-			APActive:        st.APActive,
-			Connected:       st.Connected,
-			SSID:            st.SSID,
-			IPv4:            st.IPv4,
-			APSSID:          s.cfg.APSSID,
-			ProvisioningURL: st.ProvisioningURL,
-			Uptime:          sys.Uptime,
-			MemPercent:      sys.MemPercent,
-			DiskPercent:     sys.DiskPercent,
-		}
-		if err := disp.Render(dst); err != nil {
-			s.logger.Warn("render OLED display", "error", err)
-		}
-	}
-
-	render()
+	s.renderStatus(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			render()
+			s.renderStatus(ctx)
 		}
+	}
+}
+
+// renderStatus mirrors s.status() onto the OLED panel, if any. It's shared by
+// runDisplay's periodic tick and anything that needs to force an immediate
+// repaint outside that tick - namely the reset button restoring the normal
+// screen once a hold is cancelled or finishes.
+func (s *Service) renderStatus(ctx context.Context) {
+	disp := s.getDisplay()
+	if disp == nil {
+		return
+	}
+	st, err := s.status(ctx)
+	if err != nil {
+		return
+	}
+	sys := sysinfo.Read()
+	dst := display.Status{
+		APActive:        st.APActive,
+		Connected:       st.Connected,
+		SSID:            st.SSID,
+		IPv4:            st.IPv4,
+		APSSID:          s.cfg.APSSID,
+		ProvisioningURL: st.ProvisioningURL,
+		Uptime:          sys.Uptime,
+		MemPercent:      sys.MemPercent,
+		DiskPercent:     sys.DiskPercent,
+	}
+	if err := disp.Render(dst); err != nil {
+		s.logger.Warn("render OLED display", "error", err)
 	}
 }
 
@@ -715,6 +776,17 @@ func (s *Service) forgetWiFi(ctx context.Context) error {
 
 func (s *Service) forgetWiFiProfile(ctx context.Context) error {
 	return run(ctx, "sudo", "/usr/local/lib/rpi-provision/rpi-provision", "delete-wifi-profile", s.cfg.WiFiProfile)
+}
+
+// resetWiFi forgets all Wi-Fi profiles and re-enables the setup AP - the
+// same sequence as the /api/reset-network endpoint (handleResetNetwork), but
+// callable directly by the hardware reset button, which has no admin token
+// to present.
+func (s *Service) resetWiFi(ctx context.Context) error {
+	if err := s.forgetWiFi(ctx); err != nil {
+		return err
+	}
+	return s.enableAP(ctx)
 }
 
 func (s *Service) requireToken(next http.HandlerFunc) http.HandlerFunc {
