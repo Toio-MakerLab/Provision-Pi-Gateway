@@ -73,5 +73,10 @@ case "$cmd" in
     "$SYSTEMCTL" reboot
     ;;
 
+  poweroff)
+    [[ $# -eq 0 ]] || fail "usage: poweroff"
+    "$SYSTEMCTL" poweroff
+    ;;
+
   *) fail "unknown command" ;;
 esac

@@ -3,6 +3,7 @@ Cmnd_Alias RPI_PROVISION = /usr/local/lib/rpi-provision/rpi-provision ap-up *, \
                            /usr/local/lib/rpi-provision/rpi-provision connect *, \
                            /usr/local/lib/rpi-provision/rpi-provision delete-wifi-profile *, \
                            /usr/local/lib/rpi-provision/rpi-provision forget-wifi *, \
-                           /usr/local/lib/rpi-provision/rpi-provision reboot
+                           /usr/local/lib/rpi-provision/rpi-provision reboot, \
+                           /usr/local/lib/rpi-provision/rpi-provision poweroff
 
 provision ALL=(root) NOPASSWD: RPI_PROVISION

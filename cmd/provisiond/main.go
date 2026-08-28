@@ -43,6 +43,13 @@ type Config struct {
 	ResetButtonPin      string
 	ResetButtonHoldTime time.Duration
 
+	PowerButtonEnabled  bool
+	PowerButtonPin      string
+	PowerButtonHoldTime time.Duration
+
+	PowerLEDEnabled bool
+	PowerLEDPin     string
+
 	OLEDEnabled    bool
 	OLEDDriver     display.Driver
 	OLEDI2CBus     string
@@ -68,6 +75,11 @@ type Status struct {
 	SSID            string `json:"ssid,omitempty"`
 	IPv4            string `json:"ipv4,omitempty"`
 	ProvisioningURL string `json:"provisioning_url,omitempty"`
+	// Signal is the connected network's quality, 0-100, from nmcli - the same
+	// metric scan() already reports per-network in Network.Signal. 0/omitted
+	// means no reading was available (e.g. not connected, or the nmcli lookup
+	// failed), not an actual zero-strength association.
+	Signal int `json:"signal,omitempty"`
 }
 
 type Network struct {
@@ -155,6 +167,13 @@ func configFromEnv() Config {
 		ResetButtonPin:      getenv("RESET_BUTTON_PIN", "17"),
 		ResetButtonHoldTime: getenvDuration("RESET_BUTTON_HOLD_TIME", 3*time.Second),
 
+		PowerButtonEnabled:  getenvBool("POWER_BUTTON_ENABLED", false),
+		PowerButtonPin:      getenv("POWER_BUTTON_PIN", "27"),
+		PowerButtonHoldTime: getenvDuration("POWER_BUTTON_HOLD_TIME", 5*time.Second),
+
+		PowerLEDEnabled: getenvBool("POWER_LED_ENABLED", false),
+		PowerLEDPin:     getenv("POWER_LED_PIN", "22"),
+
 		OLEDEnabled:    getenvBool("OLED_ENABLED", true),
 		OLEDDriver:     display.Driver(getenv("OLED_DRIVER", string(display.DriverSH1106))),
 		OLEDI2CBus:     getenv("OLED_I2C_BUS", ""),
@@ -208,6 +227,28 @@ func main() {
 	})
 	if err != nil {
 		logger.Warn("reset button unavailable", "error", err)
+	}
+
+	powerButton, err := gpio.New(gpio.Config{
+		Enabled:  cfg.PowerButtonEnabled,
+		Pin:      cfg.PowerButtonPin,
+		HoldTime: cfg.PowerButtonHoldTime,
+	})
+	if err != nil {
+		logger.Warn("power button unavailable", "error", err)
+	}
+
+	powerLED, err := gpio.NewLED(gpio.LEDConfig{
+		Enabled: cfg.PowerLEDEnabled,
+		Pin:     cfg.PowerLEDPin,
+	})
+	if err != nil {
+		logger.Warn("power LED unavailable", "error", err)
+	} else {
+		// Solid on for as long as provisiond is up; the power button's OnHold
+		// turns it off right before the device actually loses power, so it
+		// doubles as feedback that a shutdown is underway.
+		_ = powerLED.Set(true)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -285,10 +326,53 @@ func main() {
 		},
 	})
 
+	// powerButton is nil (and Watch a no-op) when the power button is disabled
+	// or its pin couldn't be opened, so this is always safe to start.
+	go powerButton.Watch(ctx, gpio.Callbacks{
+		// OnPress shows a "Power Off" countdown for as long as the button
+		// stays down, mirroring the reset button's feedback.
+		OnPress: func(held time.Duration) {
+			disp := s.getDisplay()
+			if disp == nil {
+				return
+			}
+			remaining := cfg.PowerButtonHoldTime - held
+			if remaining < 0 {
+				remaining = 0
+			}
+			remainingSeconds := int(remaining / time.Second)
+			if remaining%time.Second != 0 {
+				remainingSeconds++ // round up so the countdown reads 3,2,1 instead of dropping straight to 0
+			}
+			_ = disp.ShowLines("Power Off", fmt.Sprintf("Hold %ds more", remainingSeconds), "Release to cancel")
+		},
+		// OnRelease fires whether or not the hold completed - if it was
+		// released early (cancelled) the countdown would otherwise stay on
+		// screen until runDisplay's next OLEDRefresh tick.
+		OnRelease: func() {
+			s.renderStatus(ctx)
+		},
+		OnHold: func() {
+			logger.Warn("power button held; shutting down", "pin", cfg.PowerButtonPin, "hold", cfg.PowerButtonHoldTime.String())
+			// Off first: the device is about to lose power, so this is the last
+			// chance to give physical feedback that the shutdown is underway.
+			_ = powerLED.Set(false)
+			if disp := s.getDisplay(); disp != nil {
+				_ = disp.ShowLines("Power Off", "Shutting down...")
+			}
+			if err := s.powerOff(context.Background()); err != nil {
+				logger.Error("power button triggered shutdown failed", "error", err)
+				_ = powerLED.Set(true)
+				s.renderStatus(ctx)
+			}
+		},
+	})
+
 	<-ctx.Done()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	_ = server.Shutdown(shutdownCtx)
+	_ = powerLED.Set(false)
 }
 
 // runDisplay periodically mirrors s.status() onto the OLED panel, if any. It reuses
@@ -333,6 +417,7 @@ func (s *Service) renderStatus(ctx context.Context) {
 		IPv4:            st.IPv4,
 		APSSID:          s.cfg.APSSID,
 		ProvisioningURL: st.ProvisioningURL,
+		Signal:          st.Signal,
 		Uptime:          sys.Uptime,
 		MemPercent:      sys.MemPercent,
 		DiskPercent:     sys.DiskPercent,
@@ -637,10 +722,41 @@ func (s *Service) status(ctx context.Context) (Status, error) {
 			}
 		}
 	}
+	if st.Connected {
+		if pct, ok := s.currentSignal(ctx); ok {
+			st.Signal = pct
+		}
+	}
 	if st.APActive {
 		st.ProvisioningURL = "http://" + s.cfg.APAddress
 	}
 	return st, nil
+}
+
+// currentSignal returns the 0-100 signal quality of whichever network is
+// currently associated on s.cfg.Interface. It reuses "device wifi list" -
+// the same nmcli source scan() reads Network.Signal from - rather than a
+// fresh scan, so it stays cheap enough to call on every status() (including
+// the OLED's periodic refresh): nmcli answers from its already-cached scan
+// results unless --rescan is passed. The connected entry is the one nmcli
+// itself marks IN-USE ("*"), which is how nmcli distinguishes it from every
+// other network the same scan saw.
+func (s *Service) currentSignal(ctx context.Context) (int, bool) {
+	out, err := runOutput(ctx, "nmcli", "-t", "-f", "IN-USE,SIGNAL", "device", "wifi", "list", "ifname", s.cfg.Interface)
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := splitEscapedColon(line)
+		if len(fields) < 2 || fields[0] != "*" {
+			continue
+		}
+		var pct int
+		if _, err := fmt.Sscanf(fields[1], "%d", &pct); err == nil {
+			return pct, true
+		}
+	}
+	return 0, false
 }
 
 func (s *Service) scan(ctx context.Context) ([]Network, error) {
@@ -787,6 +903,14 @@ func (s *Service) resetWiFi(ctx context.Context) error {
 		return err
 	}
 	return s.enableAP(ctx)
+}
+
+// powerOff shuts the device down cleanly, invoked by the hardware power
+// button's OnHold - it has no admin token to present, so unlike
+// handleReboot this isn't gated behind AllowReboot: holding the button
+// already proves physical access to the device.
+func (s *Service) powerOff(ctx context.Context) error {
+	return run(ctx, "sudo", "/usr/local/lib/rpi-provision/rpi-provision", "poweroff")
 }
 
 func (s *Service) requireToken(next http.HandlerFunc) http.HandlerFunc {

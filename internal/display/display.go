@@ -73,6 +73,13 @@ type Status struct {
 	APSSID          string
 	ProvisioningURL string
 
+	// Signal is the currently-associated Wi-Fi network's quality, 0-100, as
+	// reported by nmcli. Only meaningful when Connected is true; 0 means
+	// unknown (e.g. the read failed) rather than an actual zero-strength
+	// association, so Render treats it the same as "no reading" and omits
+	// both the RSSI figure and the signal icon.
+	Signal int
+
 	// Uptime, MemPercent, and DiskPercent are host stats shown on a trailing
 	// status line. Zero-value Uptime means "unavailable" and suppresses the
 	// line entirely, since a freshly booted device can't be told apart from
@@ -252,19 +259,26 @@ func (d *Display) maxChars() int {
 	return n
 }
 
-// Render draws a 2-3 line status screen. It skips the I2C write entirely when the
+// Render draws a 2-3 line status screen, plus a signal-strength icon in the
+// top-right corner while connected. It skips the I2C write entirely when the
 // content hasn't changed since the last call, to avoid needless bus traffic.
 func (d *Display) Render(st Status) error {
 	if d == nil {
 		return nil
 	}
-	return d.drawLines(d.statusLines(st))
+	var bars int
+	if st.Connected {
+		bars = signalBars(st.Signal)
+	}
+	return d.drawLines(d.statusLines(st), bars)
 }
 
 // ShowLines draws arbitrary text instead of a Status snapshot, using the same
 // centered layout and change-skipping as Render. It exists for transient
 // screens that have no Status to derive from - e.g. the hardware reset
-// button's hold countdown and "Resetting Wi-Fi..." confirmation.
+// button's hold countdown and "Resetting Wi-Fi..." confirmation. It never
+// draws the signal icon, since those screens have no Status to read a signal
+// reading from.
 func (d *Display) ShowLines(lines ...string) error {
 	if d == nil {
 		return nil
@@ -274,14 +288,19 @@ func (d *Display) ShowLines(lines ...string) error {
 	for i, line := range lines {
 		truncated[i] = truncate(line, max)
 	}
-	return d.drawLines(truncated)
+	return d.drawLines(truncated, 0)
 }
 
-// drawLines renders lines onto the panel. It skips the I2C write entirely
-// when the content hasn't changed since the last call, to avoid needless bus
+// drawLines renders lines onto the panel, plus a wifiBars-bar signal icon in
+// the top-right corner when wifiBars > 0. It skips the I2C write entirely
+// when neither has changed since the last call, to avoid needless bus
 // traffic.
-func (d *Display) drawLines(lines []string) error {
-	text := strings.Join(lines, "\n")
+func (d *Display) drawLines(lines []string, wifiBars int) error {
+	// wifiBars is folded into the change-detection key (as a NUL-delimited
+	// suffix no line's truncated text can ever contain) so a signal reading
+	// that changes the bar count still triggers a redraw even when every text
+	// line stays the same.
+	text := fmt.Sprintf("%s\x00%d", strings.Join(lines, "\n"), wifiBars)
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -320,6 +339,10 @@ func (d *Display) drawLines(lines []string) error {
 		drawer.DrawString(line)
 	}
 
+	if wifiBars > 0 {
+		drawWiFiIcon(img, panelWidth, wifiBars)
+	}
+
 	if err := d.dev.draw(img.Pix); err != nil {
 		return fmt.Errorf("draw sh1106: %w", err)
 	}
@@ -352,8 +375,19 @@ func (d *Display) statusLines(st Status) []string {
 	var lines []string
 	switch {
 	case st.Connected:
+		// The header doubles as the RSSI readout when a signal reading is
+		// available, rather than adding a dedicated fourth line: the panel is
+		// only 64px tall, and a signal-icon-sized header (see drawWiFiIcon)
+		// keeps this short enough to stay clear of that icon's top-right
+		// corner. Falls back to the plain "Wi-Fi Connected" wording - matching
+		// the width the icon-free layout was measured against - when Signal
+		// is 0 (unknown), since Render() also skips the icon in that case.
+		header := "Wi-Fi Connected"
+		if st.Signal > 0 {
+			header = fmt.Sprintf("WiFi %ddBm", dBmFromQuality(st.Signal))
+		}
 		lines = []string{
-			truncate("Wi-Fi Connected", max),
+			truncate(header, max),
 			truncate("SSID: "+st.SSID, max),
 			truncate("IP: "+orPlaceholder(st.IPv4, "..."), max),
 		}
@@ -395,6 +429,72 @@ func formatUptime(d time.Duration) string {
 		return fmt.Sprintf("%dh%dm", hours, minutes)
 	default:
 		return fmt.Sprintf("%dm", minutes)
+	}
+}
+
+// dBmFromQuality approximates RSSI in dBm from nmcli's 0-100 signal quality
+// percentage. nmcli (like NetworkManager internally) only ever exposes that
+// percentage, not the raw dBm the radio driver measured, so this inverts the
+// linear quality=2*(dBm+100) mapping most drivers use to produce it -
+// dBm -100 (no signal) maps to 0%, dBm -50 (excellent) maps to 100%. It's an
+// approximation, not a re-measurement, but it's the industry-standard one
+// (the same formula iwconfig and Android both use) and matches what a user
+// would see quoted as "RSSI" elsewhere.
+func dBmFromQuality(pct int) int {
+	if pct < 0 {
+		pct = 0
+	} else if pct > 100 {
+		pct = 100
+	}
+	return pct/2 - 100
+}
+
+// signalBars maps a 0-100 nmcli signal quality percentage to a 0-4 bar count
+// for drawWiFiIcon, using the same breakpoints a phone's Wi-Fi status icon
+// would. pct <= 0 (Signal's "unknown" sentinel, see Status.Signal) returns 0
+// so callers know to skip drawing the icon entirely rather than show a
+// misleadingly empty one.
+func signalBars(pct int) int {
+	switch {
+	case pct <= 0:
+		return 0
+	case pct < 30:
+		return 1
+	case pct < 60:
+		return 2
+	case pct < 85:
+		return 3
+	default:
+		return 4
+	}
+}
+
+// drawWiFiIcon draws a 4-bar ascending signal-strength glyph anchored to the
+// panel's top-right corner, filling the leftmost barCount bars solid and
+// leaving the rest blank - the same convention as a phone's status bar, so
+// the bar count reads the same way at a glance. panelWidth positions it
+// against the right edge regardless of the configured display width.
+func drawWiFiIcon(img *image1bit.VerticalLSB, panelWidth, barCount int) {
+	const (
+		bars         = 4
+		barWidth     = 2
+		barGap       = 1
+		maxBarHeight = 9
+		rightMargin  = 2
+	)
+	totalWidth := bars*barWidth + (bars-1)*barGap
+	startX := panelWidth - rightMargin - totalWidth
+	for i := 0; i < bars && i < barCount; i++ {
+		// Bars ascend left to right and sit on a common baseline (y ==
+		// maxBarHeight-1), like a real signal-strength icon, rather than all
+		// being the same height.
+		h := maxBarHeight * (i + 1) / bars
+		x0 := startX + i*(barWidth+barGap)
+		for x := x0; x < x0+barWidth; x++ {
+			for y := maxBarHeight - h; y < maxBarHeight; y++ {
+				img.SetBit(x, y, image1bit.On)
+			}
+		}
 	}
 }
 
