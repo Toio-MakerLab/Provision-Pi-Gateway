@@ -1,5 +1,5 @@
-// Package sysinfo reads lightweight host stats (uptime, memory, disk) for
-// display on the OLED status screen.
+// Package sysinfo reads lightweight host stats (uptime, memory, disk, CPU
+// temperature) for display on the OLED status screen.
 package sysinfo
 
 import (
@@ -19,6 +19,11 @@ type Stats struct {
 	Uptime      time.Duration
 	MemPercent  int // 0-100
 	DiskPercent int // 0-100, root filesystem
+	// CPUTempC is the SoC temperature in degrees Celsius, read from the
+	// kernel's thermal_zone0 sysfs node. 0 means "unavailable" (missing
+	// thermal_zone0, e.g. off-Pi development), which a real reading never
+	// naturally produces.
+	CPUTempC float64
 }
 
 // Read gathers whatever stats are available, leaving individual fields at
@@ -35,6 +40,9 @@ func Read() Stats {
 	}
 	if pct, err := readDiskPercent("/"); err == nil {
 		st.DiskPercent = pct
+	}
+	if c, err := readCPUTemp(); err == nil {
+		st.CPUTempC = c
 	}
 	return st
 }
@@ -102,4 +110,19 @@ func readDiskPercent(path string) (int, error) {
 		return 0, fmt.Errorf("statfs reported zero total blocks")
 	}
 	return int((total - free) * 100 / total), nil
+}
+
+// readCPUTemp reads the SoC temperature from the kernel's thermal sysfs node.
+// thermal_zone0 reports in milli-degrees Celsius, so the raw value is divided
+// by 1000 to get whole-plus-fractional degrees.
+func readCPUTemp() (float64, error) {
+	data, err := os.ReadFile("/sys/class/thermal/thermal_zone0/temp")
+	if err != nil {
+		return 0, err
+	}
+	milliC, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64)
+	if err != nil {
+		return 0, err
+	}
+	return milliC / 1000, nil
 }

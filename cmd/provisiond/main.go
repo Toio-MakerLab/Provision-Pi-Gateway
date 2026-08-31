@@ -421,6 +421,7 @@ func (s *Service) renderStatus(ctx context.Context) {
 		Uptime:          sys.Uptime,
 		MemPercent:      sys.MemPercent,
 		DiskPercent:     sys.DiskPercent,
+		CPUTempC:        sys.CPUTempC,
 	}
 	if err := disp.Render(dst); err != nil {
 		s.logger.Warn("render OLED display", "error", err)

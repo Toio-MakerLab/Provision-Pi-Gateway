@@ -80,13 +80,17 @@ type Status struct {
 	// both the RSSI figure and the signal icon.
 	Signal int
 
-	// Uptime, MemPercent, and DiskPercent are host stats shown on a trailing
-	// status line. Zero-value Uptime means "unavailable" and suppresses the
-	// line entirely, since a freshly booted device can't be told apart from
-	// a caller that never populated these fields.
+	// Uptime, MemPercent, DiskPercent, and CPUTempC are host stats shown on a
+	// trailing status line. Zero-value Uptime means "unavailable" and
+	// suppresses the line entirely, since a freshly booted device can't be
+	// told apart from a caller that never populated these fields.
 	Uptime      time.Duration
 	MemPercent  int // 0-100
 	DiskPercent int // 0-100, root filesystem
+	// CPUTempC is the SoC temperature in degrees Celsius. 0 means
+	// "unavailable" and omits just the temperature reading from the sys
+	// line, since Uptime already gates the whole line.
+	CPUTempC float64
 }
 
 // Display renders Status snapshots onto an SH1106 panel. A nil *Display is valid
@@ -408,7 +412,16 @@ func (d *Display) statusLines(st Status) []string {
 		}
 	}
 	if st.Uptime > 0 {
-		sysLine := fmt.Sprintf("Up %s M%d%% D%d%%", formatUptime(st.Uptime), st.MemPercent, st.DiskPercent)
+		sysLine := fmt.Sprintf("Up%s M%d%%", formatUptime(st.Uptime), st.MemPercent)
+		// Appended rather than baked into the Sprintf above so a missing
+		// reading (CPUTempC == 0, e.g. no thermal_zone0 on non-Pi hosts)
+		// degrades to the plain uptime/mem line instead of showing a
+		// bogus "0C". "C" rather than "°C": basicfont.Face7x13 is ASCII-only
+		// (see truncate()'s doc comment), so U+00B0 would draw as a garbled
+		// box glyph instead of a degree sign.
+		if st.CPUTempC > 0 {
+			sysLine += fmt.Sprintf(" T%.0fC", st.CPUTempC)
+		}
 		lines = append(lines, truncate(sysLine, max))
 	}
 	return lines
